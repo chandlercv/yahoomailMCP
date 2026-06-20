@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "yahoo-mail": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "D:\\workspace\\yahoomailMCP\\server.mjs"
+      ],
+      "env": {}
+    }
+  }
+}

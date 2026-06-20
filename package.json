@@ -1,0 +1,23 @@
+{
+  "name": "yahoomailmcp",
+  "version": "1.0.0",
+  "description": "MCP server for Yahoo Mail - spam management and family email monitoring",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "yahoo",
+    "mail",
+    "imap"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "imapflow": "^1.4.2",
+    "mailparser": "^3.9.11"
+  }
+}
