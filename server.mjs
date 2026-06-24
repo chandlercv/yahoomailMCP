@@ -365,7 +365,7 @@ server.tool(
   "Fetch a batch of UNTRAINED emails for spam classification. Skips already-classified emails and supports pagination via offset. Returns emails with previews so you can classify each as 'not_spam', 'marketing', or 'hard_spam'.",
   {
     count: z.number().min(5).max(50).default(30).describe("Number of untrained emails to return"),
-    mailbox: z.string().default("INBOX").describe("Mailbox to pull from (try 'Bulk Mail' or 'Junk' for spam samples)"),
+    mailbox: z.string().default("INBOX").describe("Folder to pull from (try 'Bulk Mail' or 'Junk' for spam samples)"),
     offset: z.number().min(0).default(0).describe("Skip this many messages from the end of the mailbox (for pagination into older mail)"),
   },
   async ({ count, mailbox, offset }) => {
@@ -462,7 +462,7 @@ server.tool(
       }))
       .min(1)
       .describe("Array of {uid, category} classifications"),
-    mailbox: z.string().default("INBOX").describe("Mailbox the training emails came from"),
+    mailbox: z.string().default("INBOX").describe("Folder the training emails came from"),
   },
   async ({ classifications, mailbox }) => {
     const client = await getImapClient();
@@ -732,7 +732,7 @@ server.tool(
 
         output += "\n\nActions:";
         if (hardSpam.length) output += `\n  move_to_junk UIDs: [${hardSpam.map((s) => s.uid).join(", ")}]`;
-        if (marketing.length) output += `\n  move_to_marketing UIDs: [${marketing.map((s) => s.uid).join(", ")}]`;
+        if (marketing.length) output += `\n  move_to_folder UIDs: [${marketing.map((s) => s.uid).join(", ")}]`;
 
         return { content: [{ type: "text", text: output }] };
       } finally {
@@ -767,8 +767,8 @@ server.tool(
 );
 
 server.tool(
-  "move_to_marketing",
-  "Move marketing emails to a review-later folder. Creates the folder if needed.",
+  "move_to_folder",
+  "Move emails to a specified folder by UID. Creates the folder if needed.",
   {
     uids: z.array(z.number()).min(1).describe("Email UIDs to move"),
     folder: z.string().default("Marketing").describe("Destination folder"),
@@ -794,7 +794,7 @@ server.tool(
   "move_to_inbox",
   "Rescue emails from Junk or Marketing back to Inbox.",
   {
-    uids: z.array(z.number()).min(1).describe("Email UIDs to rescue"),
+    uids: z.array(z.number()).min(1).describe("Email UIDs to move back to Inbox"),
     from_folder: z.string().default("Bulk Mail").describe("Source folder"),
   },
   async ({ uids, from_folder }) => {
@@ -889,7 +889,7 @@ server.tool(
 
 server.tool(
   "get_family_emails",
-  "Get recent emails from the Chandler family.",
+  "Get recent emails from the Chandler family. Searches both INBOX and the !!ChandlerFamily folder.",
   {
     count: z.number().min(1).max(50).default(20).describe("Number of recent emails to scan"),
     unread_only: z.boolean().default(false).describe("Only show unread family emails"),
@@ -897,57 +897,94 @@ server.tool(
   async ({ count, unread_only }) => {
     const client = await getImapClient();
     try {
-      const lock = await client.getMailboxLock("INBOX");
-      try {
-        const familyMessages = [];
-        const total = client.mailbox.exists;
-        const scanCount = Math.min(total, count * 3);
-        const startSeq = Math.max(1, total - scanCount + 1);
+      const familyMessages = [];
+      const foldersSearched = [];
 
-        for await (const msg of client.fetch(`${startSeq}:*`, {
-          envelope: true,
-          flags: true,
-          source: true,
-        })) {
-          if (!isFamilyEmail(msg.envelope)) continue;
-          if (unread_only && msg.flags?.has("\\Seen")) continue;
+      for (const mailbox of ["INBOX", "!!ChandlerFamily"]) {
+        let lock;
+        try {
+          lock = await client.getMailboxLock(mailbox);
+        } catch (err) {
+          log(`Could not open mailbox "${mailbox}": ${err.message}`);
+          continue;
+        }
+        try {
+          foldersSearched.push(mailbox);
+          const total = client.mailbox.exists;
+          if (total === 0) continue;
 
-          let preview = "";
-          if (msg.source) {
-            try {
-              const parsed = await simpleParser(msg.source);
-              preview = (parsed.text || "").slice(0, 300).replace(/\s+/g, " ").trim();
-            } catch {
-              preview = "(could not parse body)";
+          // Use IMAP SEARCH to find family emails by sender pattern instead of scanning sequentially
+          let uidsToFetch = [];
+          try {
+            for (const pattern of FAMILY_PATTERNS) {
+              const uids = await client.search({ from: pattern }, { uid: true });
+              uidsToFetch.push(...uids);
             }
+            // Deduplicate and take most recent
+            uidsToFetch = [...new Set(uidsToFetch)].sort((a, b) => b - a).slice(0, count * 2);
+          } catch (err) {
+            log(`SEARCH failed in ${mailbox}, falling back to sequential scan: ${err.message}`);
+            const scanCount = Math.min(total, count * 5);
+            const startSeq = Math.max(1, total - scanCount + 1);
+            uidsToFetch = null; // signal to use sequence-based fetch
+            // Fall through to sequence-based fetch below
           }
 
-          familyMessages.push({
-            uid: msg.uid,
-            subject: msg.envelope.subject || "(no subject)",
-            from: formatAddress(msg.envelope.from),
-            date: msg.envelope.date?.toISOString(),
-            unread: !msg.flags?.has("\\Seen"),
-            preview,
-          });
+          const fetchRange = uidsToFetch && uidsToFetch.length > 0
+            ? uidsToFetch.join(",")
+            : uidsToFetch === null
+              ? `${Math.max(1, total - count * 5 + 1)}:*`
+              : null;
 
-          if (familyMessages.length >= count) break;
+          if (!fetchRange) continue;
+
+          const fetchOpts = uidsToFetch ? { uid: true } : {};
+          for await (const msg of client.fetch(fetchRange, {
+            envelope: true,
+            flags: true,
+            source: true,
+          }, fetchOpts)) {
+            if (!isFamilyEmail(msg.envelope)) continue;
+            if (unread_only && msg.flags?.has("\\Seen")) continue;
+
+            let preview = "";
+            if (msg.source) {
+              try {
+                const parsed = await simpleParser(msg.source);
+                preview = (parsed.text || "").slice(0, 300).replace(/\s+/g, " ").trim();
+              } catch {
+                preview = "(could not parse body)";
+              }
+            }
+
+            familyMessages.push({
+              uid: msg.uid,
+              mailbox,
+              subject: msg.envelope.subject || "(no subject)",
+              from: formatAddress(msg.envelope.from),
+              date: msg.envelope.date?.toISOString(),
+              unread: !msg.flags?.has("\\Seen"),
+              preview,
+            });
+          }
+        } finally {
+          lock.release();
         }
-
-        familyMessages.reverse();
-
-        if (familyMessages.length === 0) {
-          return { content: [{ type: "text", text: `No ${unread_only ? "unread " : ""}Chandler family emails found.\nFamily patterns: ${FAMILY_PATTERNS.join(", ")}` }] };
-        }
-
-        const details = familyMessages
-          .map((m) => `${m.unread ? "[NEW] " : ""}UID:${m.uid}\nFrom: ${m.from}\nDate: ${m.date?.slice(0, 16)}\nSubject: ${m.subject}\nPreview: ${m.preview}\n`)
-          .join("\n---\n");
-
-        return { content: [{ type: "text", text: `Found ${familyMessages.length} Chandler family email(s):\n\n${details}` }] };
-      } finally {
-        lock.release();
       }
+
+      // Sort all results by date descending, then cap at requested count
+      familyMessages.sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+      const results = familyMessages.slice(0, count);
+
+      if (results.length === 0) {
+        return { content: [{ type: "text", text: `No ${unread_only ? "unread " : ""}Chandler family emails found.\nSearched: ${foldersSearched.join(", ")}\nFamily patterns: ${FAMILY_PATTERNS.join(", ")}` }] };
+      }
+
+      const details = results
+        .map((m) => `${m.unread ? "[NEW] " : ""}UID:${m.uid} [${m.mailbox}]\nFrom: ${m.from}\nDate: ${m.date?.slice(0, 16)}\nSubject: ${m.subject}\nPreview: ${m.preview}\n`)
+        .join("\n---\n");
+
+      return { content: [{ type: "text", text: `Found ${results.length} Chandler family email(s) across ${foldersSearched.join(", ")}:\n\n${details}` }] };
     } finally {
       await client.logout();
     }
@@ -959,7 +996,7 @@ server.tool(
   "Read the full content of a specific email by UID.",
   {
     uid: z.number().describe("The UID of the email to read"),
-    mailbox: z.string().default("INBOX").describe("Mailbox to read from"),
+    mailbox: z.string().default("INBOX").describe("Folder to read from"),
   },
   async ({ uid, mailbox }) => {
     const client = await getImapClient();
@@ -991,7 +1028,7 @@ server.tool(
   "search_emails",
   "Search emails by criteria (from, subject, date range, etc.)",
   {
-    mailbox: z.string().default("INBOX").describe("Mailbox to search"),
+    mailbox: z.string().default("INBOX").describe("Folder to search"),
     from: z.string().optional().describe("Search by sender"),
     subject: z.string().optional().describe("Search by subject"),
     since: z.string().optional().describe("Emails since YYYY-MM-DD"),
@@ -1046,8 +1083,8 @@ server.tool(
 );
 
 server.tool(
-  "list_mailboxes",
-  "List all mailbox folders.",
+  "list_folders",
+  "List all folders.",
   {},
   async () => {
     const client = await getImapClient();
@@ -1056,7 +1093,235 @@ server.tool(
       const formatted = mailboxes
         .map((mb) => `${mb.path} ${mb.flags ? `[${[...mb.flags].join(", ")}]` : ""}`)
         .join("\n");
-      return { content: [{ type: "text", text: `Mailbox folders:\n\n${formatted}` }] };
+      return { content: [{ type: "text", text: `Folders:\n\n${formatted}` }] };
+    } finally {
+      await client.logout();
+    }
+  }
+);
+
+// ── Receipt summarization ──
+
+const RECEIPT_SUBJECT_KEYWORDS = [
+  "receipt", "order confirmation", "payment confirmation",
+  "purchase confirmation", "order confirmed", "your order",
+  "invoice", "payment received", "shipping confirmation",
+  "payment processed", "bill is ready", "thanks for your payment",
+];
+
+function extractMerchant(envelope) {
+  const fromName = envelope.from?.[0]?.name || "";
+  const fromAddr = envelope.from?.[0]?.address || "";
+
+  if (fromName && !/^(no-?reply|mail|info|notification)/i.test(fromName)) {
+    const cleaned = fromName.replace(/\s*(support|billing|orders|no-?reply|notifications?|customer\s*service)\s*/gi, "").trim();
+    if (cleaned) return cleaned;
+  }
+
+  const domain = extractDomain(fromAddr);
+  if (domain) {
+    const parts = domain.split(".");
+    const name = parts.length >= 2 ? parts[parts.length - 2] : parts[0];
+    return name.charAt(0).toUpperCase() + name.slice(1);
+  }
+  return "Unknown";
+}
+
+function extractReceiptAmount(text) {
+  if (!text) return null;
+
+  const totalPatterns = [
+    /(?:grand\s+)?total\s*(?:charged|paid|due|amount)?[\s:]*\$\s*([\d,]+\.?\d{0,2})/i,
+    /(?:amount\s+(?:charged|paid|due))[\s:]*\$\s*([\d,]+\.?\d{0,2})/i,
+    /(?:you\s+(?:paid|were\s+charged))[\s:]*\$\s*([\d,]+\.?\d{0,2})/i,
+    /(?:charge|payment)\s+of\s+\$\s*([\d,]+\.?\d{0,2})/i,
+  ];
+
+  for (const pattern of totalPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      const val = parseFloat(match[1].replace(/,/g, ""));
+      if (val > 0 && val < 100000) return val;
+    }
+  }
+
+  const allAmounts = [...text.matchAll(/\$([\d,]+\.\d{2})/g)]
+    .map((m) => parseFloat(m[1].replace(/,/g, "")))
+    .filter((n) => n > 0 && n < 100000);
+
+  if (allAmounts.length > 0) return Math.max(...allAmounts);
+  return null;
+}
+
+function extractOrderNumber(text, subject) {
+  const combined = `${subject} ${text}`;
+  const patterns = [
+    /(?:order|confirmation|transaction|reference|tracking)\s*(?:#|number|no\.?|id)?[\s:#]*([A-Z0-9][\w-]{4,30})/i,
+    /#\s*([A-Z0-9][\w-]{4,30})/i,
+  ];
+  for (const pattern of patterns) {
+    const match = combined.match(pattern);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+function isLikelyReceipt(subject, text) {
+  let score = 0;
+  const subjectLower = (subject || "").toLowerCase();
+  const combined = `${subjectLower} ${(text || "").toLowerCase()}`;
+
+  if (/receipt/i.test(subjectLower)) score += 3;
+  if (/order\s*(confirm|#|\d)/i.test(subjectLower)) score += 3;
+  if (/payment\s*(confirm|receipt)/i.test(subjectLower)) score += 3;
+  if (/invoice/i.test(subjectLower)) score += 2;
+  if (/purchase/i.test(subjectLower)) score += 2;
+  if (/shipping\s*confirm/i.test(subjectLower)) score += 1;
+
+  if (/\$[\d,]+\.\d{2}/.test(text)) score += 2;
+  if (/total[\s:]/i.test(combined)) score += 1;
+  if (/order\s*(number|#|id)/i.test(combined)) score += 1;
+  if (/item|qty|quantity|product/i.test(combined)) score += 1;
+  if (/subtotal/i.test(combined)) score += 1;
+  if (/\btax\b/i.test(combined)) score += 0.5;
+
+  if (/\bunsubscribe\b/i.test(combined)) score -= 1;
+  if (/\d+%\s*off/i.test(combined)) score -= 2;
+  if (/coupon|promo\s*code/i.test(combined)) score -= 1.5;
+  if (/act\s*now|limited\s*time/i.test(combined)) score -= 2;
+
+  return score >= 3;
+}
+
+server.tool(
+  "summarize_receipts",
+  "Scan inbox for receipt and order confirmation emails, extract purchase details (merchant, amount, date, order number), return a formatted summary, and optionally move them to !Receipts.",
+  {
+    count: z.number().min(1).max(200).default(50).describe("Number of recent emails to scan for receipts"),
+    since: z.string().optional().describe("Only include emails since YYYY-MM-DD"),
+    move: z.boolean().default(true).describe("Move found receipts to !Receipts folder (false = dry run)"),
+  },
+  async ({ count, since, move }) => {
+    const client = await getImapClient();
+    try {
+      if (move) {
+        try { await client.mailboxCreate("!Receipts"); } catch {}
+      }
+
+      const lock = await client.getMailboxLock("INBOX");
+      try {
+        const candidateUids = new Set();
+
+        // Phase 1a: IMAP SEARCH by subject keywords
+        for (const keyword of RECEIPT_SUBJECT_KEYWORDS) {
+          try {
+            const query = { subject: keyword };
+            if (since) query.since = new Date(since);
+            const results = await client.search(query, { uid: true });
+            for (const uid of results) candidateUids.add(uid);
+          } catch {}
+        }
+
+        // Phase 1b: Sequential scan fallback
+        const total = client.mailbox.exists;
+        const startSeq = Math.max(1, total - count + 1);
+        for await (const msg of client.fetch(`${startSeq}:*`, { envelope: true })) {
+          const subj = (msg.envelope.subject || "").toLowerCase();
+          if (RECEIPT_SUBJECT_KEYWORDS.some((kw) => subj.includes(kw))) {
+            candidateUids.add(msg.uid);
+          }
+        }
+
+        if (candidateUids.size === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: `No receipt emails found in the last ${count} messages${since ? ` since ${since}` : ""}.\nTip: Try increasing count or adjusting the date range.`,
+            }],
+          };
+        }
+
+        // Phase 2: Fetch, parse, extract
+        const receipts = [];
+        const uidList = [...candidateUids].sort((a, b) => b - a).slice(0, count);
+
+        for await (const msg of client.fetch(uidList.join(","), {
+          source: true,
+          envelope: true,
+        }, { uid: true })) {
+          let text = "";
+          try {
+            const parsed = await simpleParser(msg.source);
+            text = (parsed.text || parsed.html?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ") || "").slice(0, 3000);
+          } catch { continue; }
+
+          const subject = msg.envelope.subject || "";
+          if (!isLikelyReceipt(subject, text)) continue;
+
+          receipts.push({
+            uid: msg.uid,
+            merchant: extractMerchant(msg.envelope),
+            amount: extractReceiptAmount(text),
+            date: msg.envelope.date?.toISOString()?.slice(0, 10) || "unknown",
+            orderNumber: extractOrderNumber(text, subject),
+            subject,
+          });
+        }
+
+        receipts.sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+
+        if (receipts.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: `Scanned ${candidateUids.size} candidate email(s) but none confirmed as receipts.\nTip: Try increasing count or broadening the date range.`,
+            }],
+          };
+        }
+
+        // Build summary
+        let output = `Receipt Summary: ${receipts.length} receipt(s) found`;
+        if (since) output += ` since ${since}`;
+        output += `\n${"=".repeat(45)}\n\n`;
+
+        receipts.forEach((r, i) => {
+          output += `${i + 1}. ${r.merchant}`;
+          output += r.amount != null ? ` - $${r.amount.toFixed(2)}` : ` - (amount not found)`;
+          output += `\n   Date: ${r.date}`;
+          if (r.orderNumber) output += `\n   Order: ${r.orderNumber}`;
+          output += `\n   Subject: ${r.subject}\n\n`;
+        });
+
+        output += `${"-".repeat(45)}`;
+        const receiptsWithAmount = receipts.filter((r) => r.amount != null);
+        if (receiptsWithAmount.length > 0) {
+          const totalAmount = receiptsWithAmount.reduce((sum, r) => sum + r.amount, 0);
+          output += `\nTotal: $${totalAmount.toFixed(2)} across ${receiptsWithAmount.length} receipt(s)`;
+        }
+        const dates = receipts.map((r) => r.date).filter((d) => d !== "unknown").sort();
+        if (dates.length > 0) {
+          output += `\nDate range: ${dates[0]} to ${dates[dates.length - 1]}`;
+        }
+
+        // Move
+        const receiptUids = receipts.map((r) => r.uid);
+        if (move) {
+          try {
+            await client.messageMove(receiptUids.join(","), "!Receipts", { uid: true });
+            output += `\nMoved ${receiptUids.length} email(s) to "!Receipts"`;
+          } catch (err) {
+            output += `\nFailed to move emails: ${err.message}`;
+            log(`Move to !Receipts failed: ${err.message}`);
+          }
+        } else {
+          output += `\nDry run - no emails moved (set move=true to organize)`;
+          output += `\nUIDs: [${receiptUids.join(", ")}]`;
+        }
+
+        return { content: [{ type: "text", text: output }] };
+      } finally {
+        lock.release();
+      }
     } finally {
       await client.logout();
     }
