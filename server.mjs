@@ -25,6 +25,11 @@ const FAMILY_PATTERNS = (process.env.FAMILY_CONTACTS || "chandler")
   .split(",")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
+const FAMILY_EXCLUDE_DOMAINS = (process.env.FAMILY_EXCLUDE_DOMAINS || "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+const SPOUSE_EMAIL = (process.env.SPOUSE_EMAIL || "").trim().toLowerCase();
 
 function log(msg) {
   process.stderr.write(`[yahoo-mail] ${msg}\n`);
@@ -340,7 +345,20 @@ function isFamilyEmail(envelope) {
   const allFields = addresses
     .map((a) => `${a.name || ""} ${a.address || ""}`.toLowerCase())
     .join(" ");
-  return FAMILY_PATTERNS.some((pattern) => allFields.includes(pattern));
+  if (!FAMILY_PATTERNS.some((pattern) => allFields.includes(pattern))) return false;
+
+  const fromAddr = (envelope.from?.[0]?.address || "").toLowerCase();
+  const fromDomain = extractDomain(fromAddr);
+  if (fromDomain && FAMILY_EXCLUDE_DOMAINS.some((d) => fromDomain === d || fromDomain.endsWith("." + d))) {
+    return false;
+  }
+
+  if (SPOUSE_EMAIL && fromAddr === SPOUSE_EMAIL) {
+    const recipientCount = (envelope.to || []).length + (envelope.cc || []).length;
+    if (recipientCount <= 1) return false;
+  }
+
+  return true;
 }
 
 function formatAddress(addr) {
@@ -813,6 +831,122 @@ server.tool(
   }
 );
 
+server.tool(
+  "sweep_sender",
+  "Bulk-move ALL emails from a sender pattern to a destination folder (or Bulk Mail). Loops internally until no matches remain, so one call fully drains a sender. Returns total moved.",
+  {
+    sender: z.string().describe("Sender pattern to match (e.g. 'nextdoor.com', 'krispykreme.com', 'dccc.org')"),
+    destination: z.enum(["Marketing", "Purge-Candidates", "Bulk Mail", "Receipts"]).default("Marketing").describe("Destination folder"),
+  },
+  async ({ sender, destination }) => {
+    const { totalMoved, passes } = await runSweep(sender, destination);
+    return {
+      content: [{
+        type: "text",
+        text: totalMoved === 0
+          ? `No emails found from "${sender}" in INBOX.`
+          : `Swept ${totalMoved} email(s) from "${sender}" to "${destination}" in ${passes} pass(es).`,
+      }],
+    };
+  }
+);
+
+const SWEEP_RULES_PATH = resolve(__dirname, "sweep_rules.json");
+
+async function runSweep(sender, destination, mailbox = "INBOX", batch_size = 100) {
+  let totalMoved = 0;
+  let passes = 0;
+  const maxPasses = 50;
+
+  while (passes < maxPasses) {
+    passes++;
+    const client = await getImapClient();
+    let batchMoved = 0;
+    try {
+      const lock = await client.getMailboxLock(mailbox);
+      try {
+        const uids = await client.search({ from: sender }, { uid: true });
+        if (uids.length === 0) break;
+
+        const batch = uids.slice(-batch_size);
+        if (destination !== "Bulk Mail") {
+          try { await client.mailboxCreate(destination); } catch {}
+        }
+        await client.messageMove(batch.join(","), destination, { uid: true });
+        batchMoved = batch.length;
+        totalMoved += batchMoved;
+        log(`sweep: moved ${batchMoved} from "${sender}" → "${destination}" (${totalMoved} total, pass ${passes})`);
+      } finally {
+        lock.release();
+      }
+    } finally {
+      await client.logout();
+    }
+    if (batchMoved === 0) break;
+  }
+  return { totalMoved, passes };
+}
+
+server.tool(
+  "sweep_all",
+  "Run ALL rules from sweep_rules.json against the inbox. Each sender is fully drained before moving to the next. Returns a summary of everything moved.",
+  {
+    dry_run: z.boolean().default(false).describe("If true, just report what would be swept without moving anything"),
+  },
+  async ({ dry_run }) => {
+    let rules;
+    try {
+      rules = JSON.parse(readFileSync(SWEEP_RULES_PATH, "utf8")).rules;
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error reading sweep_rules.json: ${err.message}` }] };
+    }
+
+    if (dry_run) {
+      const client = await getImapClient();
+      const counts = [];
+      try {
+        const lock = await client.getMailboxLock("INBOX");
+        try {
+          for (const rule of rules) {
+            const uids = await client.search({ from: rule.sender }, { uid: true });
+            if (uids.length > 0) {
+              counts.push(`${rule.sender} → ${rule.destination}: ${uids.length} email(s) [${rule.note}]`);
+            }
+          }
+        } finally {
+          lock.release();
+        }
+      } finally {
+        await client.logout();
+      }
+      return {
+        content: [{ type: "text", text: counts.length === 0
+          ? "No matching emails found for any rules."
+          : `Dry run — would sweep:\n\n${counts.join("\n")}\n\nTotal rules with matches: ${counts.length}` }],
+      };
+    }
+
+    const results = [];
+    let grandTotal = 0;
+    for (const rule of rules) {
+      const { totalMoved, passes } = await runSweep(rule.sender, rule.destination);
+      if (totalMoved > 0) {
+        results.push(`${rule.sender} → ${rule.destination}: ${totalMoved} moved (${passes} passes) [${rule.note}]`);
+        grandTotal += totalMoved;
+      }
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: grandTotal === 0
+          ? "No emails matched any sweep rules. Inbox is clean!"
+          : `Sweep complete: ${grandTotal} total email(s) moved across ${results.length} sender(s).\n\n${results.join("\n")}`,
+      }],
+    };
+  }
+);
+
 // ── Inbox and search tools ──
 
 server.tool(
@@ -888,10 +1022,104 @@ server.tool(
 );
 
 server.tool(
+  "summarize_inbox",
+  "Fetch recent emails with body previews for summarization. Returns sender, subject, date, and a text preview of each message so the assistant can summarize inbox contents, identify themes, and surface action items.",
+  {
+    count: z.number().min(1).max(150).default(15).describe("Number of recent emails to fetch"),
+    mailbox: z.string().default("INBOX").describe("Folder to summarize"),
+    unread_only: z.boolean().default(false).describe("Only include unread emails"),
+    preview_length: z.number().min(50).max(1000).default(300).describe("Characters of body text to include per email"),
+  },
+  async ({ count, mailbox, unread_only, preview_length }) => {
+    const trainingData = loadTrainingData();
+    const client = await getImapClient();
+    try {
+      const lock = await client.getMailboxLock(mailbox);
+      try {
+        const total = client.mailbox.exists;
+        const startSeq = Math.max(1, total - count + 1);
+        const messages = [];
+
+        for await (const msg of client.fetch(`${startSeq}:*`, {
+          envelope: true,
+          flags: true,
+          source: true,
+        })) {
+          const unread = !msg.flags?.has("\\Seen");
+          if (unread_only && !unread) continue;
+
+          let preview = "";
+          let textSnippet = "";
+          if (msg.source) {
+            try {
+              const parsed = await simpleParser(msg.source);
+              const body = parsed.text || parsed.html?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ") || "";
+              preview = body.slice(0, preview_length).replace(/\s+/g, " ").trim();
+              textSnippet = body.slice(0, 500);
+            } catch {
+              preview = "(could not parse)";
+            }
+          }
+
+          const classification = classifyEmail(msg.envelope, textSnippet, trainingData);
+
+          messages.push({
+            uid: msg.uid,
+            subject: msg.envelope.subject || "(no subject)",
+            from: formatAddress(msg.envelope.from),
+            date: msg.envelope.date?.toISOString(),
+            unread,
+            isFamily: isFamilyEmail(msg.envelope),
+            spamCategory: classification.category,
+            preview,
+          });
+        }
+
+        messages.reverse();
+
+        if (messages.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: `No ${unread_only ? "unread " : ""}emails found in ${mailbox}.`,
+            }],
+          };
+        }
+
+        const list = messages
+          .map((m, i) => {
+            let tag = "";
+            if (m.isFamily) tag = "[FAMILY] ";
+            else if (m.spamCategory === "hard_spam") tag = "[SPAM] ";
+            else if (m.spamCategory === "marketing") tag = "[MKTG] ";
+            const unreadTag = m.unread ? "[UNREAD] " : "";
+            return `${i + 1}. ${tag}${unreadTag}${m.subject}\n   From: ${m.from}\n   Date: ${m.date?.slice(0, 16)}\n   Preview: ${m.preview}`;
+          })
+          .join("\n\n");
+
+        const unreadCount = messages.filter((m) => m.unread).length;
+        const familyCount = messages.filter((m) => m.isFamily).length;
+
+        return {
+          content: [{
+            type: "text",
+            text: `${mailbox}: ${messages.length} email(s) | ${unreadCount} unread | ${familyCount} family | ${total} total in folder\n\n${list}`,
+          }],
+        };
+      } finally {
+        lock.release();
+      }
+    } finally {
+      await client.logout();
+    }
+  }
+);
+
+server.tool(
   "get_family_emails",
   "Get recent emails from the Chandler family. Searches both INBOX and the !!ChandlerFamily folder.",
   {
-    count: z.number().min(1).max(50).default(20).describe("Number of recent emails to scan"),
+    count: z.number().min(1).max(150).default(20).describe("Number of recent emails to scan"),
     unread_only: z.boolean().default(false).describe("Only show unread family emails"),
   },
   async ({ count, unread_only }) => {

@@ -1,3 +1,4 @@
 node_modules/
 .env
 training_data.json
+sweep_rules.json

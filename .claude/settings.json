@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__yahoo-mail__move_to_inbox"
+    ]
+  }
+}
